@@ -1,13 +1,14 @@
 import os
 import gc
 import numpy as np
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Generator
 import weakref
 from ..core.md_unpacker import MmapMDUnpacker, MDFrame, TriclinicBox, create_test_md_file
 from ..core.cell_binning import CellBinning
 from ..core.rdf_calculator import RDFCalculator
 from ..core.voronoi_analyzer import VoronoiAnalyzer
 from ..core.csro_calculator import CSROCalculator
+from ..core.nonaffine_analyzer import NonAffineAnalyzer
 
 
 class AnalysisService:
@@ -30,9 +31,12 @@ class AnalysisService:
         self.rdf_calc = RDFCalculator(r_min=0.0, r_max=6.0, n_bins=100)
         self.voronoi_analyzer = VoronoiAnalyzer(cutoff=5.0)
         self.csro_calc = CSROCalculator(cutoff=3.5)
+        self.nonaffine_analyzer = NonAffineAnalyzer(cutoff=4.5, yield_threshold=0.08)
         self.element_map = {1: 'Al', 2: 'Co', 3: 'Cr', 4: 'Fe', 5: 'Ni'}
         self._frame_cache = {}
         self._max_cache_frames = 5
+        self._yield_events = []
+        self._monitored_pair = None
 
     @property
     def unpacker(self) -> Optional[MmapMDUnpacker]:
@@ -224,6 +228,102 @@ class AnalysisService:
             'distances': distances.tolist(),
             'n_neighbors': len(neighbors)
         }
+
+    def analyze_nonaffine(self, frame_idx_ref: int, frame_idx_def: int) -> Dict:
+        frame_ref = self.get_frame(frame_idx_ref)
+        frame_def = self.get_frame(frame_idx_def)
+
+        result = self.nonaffine_analyzer.analyze_deformation(
+            frame_ref.coords, frame_def.coords, frame_def.box, frame_def.types
+        )
+
+        clusters = self.nonaffine_analyzer.detect_shear_band_clusters(
+            frame_def.coords, result.shear_band_atoms, frame_def.box
+        )
+
+        dissipation = self.nonaffine_analyzer.compute_dissipation_curve(
+            frame_ref.coords, frame_def.coords, frame_def.box
+        )
+
+        is_yielding = result.n_yielding > 0
+        if is_yielding:
+            event = {
+                'frame_ref': frame_idx_ref,
+                'frame_def': frame_idx_def,
+                'timestep_ref': frame_ref.timestep,
+                'timestep_def': frame_def.timestep,
+                'n_yielding': result.n_yielding,
+                'yield_ratio': result.n_yielding / result.total_atoms,
+                'dissipated_energy': result.dissipated_energy,
+                'clusters': clusters[:5],
+                'top_cluster_center': clusters[0]['center'] if clusters else None,
+                'top_cluster_size': clusters[0]['n_atoms'] if clusters else 0,
+            }
+            self._yield_events.append(event)
+
+        return {
+            'frame_ref': frame_idx_ref,
+            'frame_def': frame_idx_def,
+            'timestep_ref': frame_ref.timestep,
+            'timestep_def': frame_def.timestep,
+            'd2_min': result.d2_min.tolist(),
+            'threshold': result.threshold,
+            'n_yielding': result.n_yielding,
+            'yield_ratio': result.n_yielding / result.total_atoms,
+            'total_atoms': result.total_atoms,
+            'dissipated_energy': result.dissipated_energy,
+            'shear_band_atoms': result.shear_band_atoms.tolist(),
+            'strain_magnitudes': result.atom_strain_magnitudes.tolist(),
+            'clusters': clusters,
+            'dissipation_curve': dissipation,
+            'is_yielding': is_yielding,
+        }
+
+    def get_nonaffine_stream(self, start_frame: int = 0, end_frame: int = None,
+                              yield_threshold: float = None) -> Generator[Dict, None, None]:
+        if self._unpacker is None:
+            raise RuntimeError("No data loaded")
+        if end_frame is None:
+            end_frame = self._unpacker.n_frames - 1
+        if yield_threshold is not None:
+            self.nonaffine_analyzer.yield_threshold = yield_threshold
+
+        self._yield_events = []
+
+        for i in range(start_frame, end_frame):
+            result = self.analyze_nonaffine(i, i + 1)
+            yield {
+                'type': 'nonaffine',
+                'frame_idx': i + 1,
+                'timestep': result['timestep_def'],
+                'n_yielding': result['n_yielding'],
+                'yield_ratio': result['yield_ratio'],
+                'dissipated_energy': result['dissipated_energy'],
+                'is_yielding': result['is_yielding'],
+                'clusters': result['clusters'][:3],
+                'shear_band_atoms_count': result['n_yielding'],
+            }
+
+            if result['is_yielding']:
+                yield {
+                    'type': 'yield_event',
+                    'frame_idx': i + 1,
+                    'timestep': result['timestep_def'],
+                    'severity': 'critical' if result['yield_ratio'] > 0.05 else 'warning',
+                    'n_yielding': result['n_yielding'],
+                    'yield_ratio': result['yield_ratio'],
+                    'dissipated_energy': result['dissipated_energy'],
+                    'top_cluster_center': result['clusters'][0]['center'] if result['clusters'] else None,
+                    'top_cluster_size': result['clusters'][0]['n_atoms'] if result['clusters'] else 0,
+                    'shear_band_coords': [
+                        a['coords'] for a in result['clusters'][:1]
+                    ],
+                    'dissipation_curve': result['dissipation_curve'],
+                    'd2_min_top': sorted(result['d2_min'], reverse=True)[:10],
+                }
+
+    def get_yield_events(self) -> List[Dict]:
+        return list(self._yield_events)
 
     def clear_cache(self):
         self._frame_cache.clear()

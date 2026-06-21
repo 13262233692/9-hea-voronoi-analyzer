@@ -83,6 +83,16 @@
           </div>
         </div>
 
+        <MicrostructureProjection
+          v-if="frameInfo"
+          :atoms="projectionAtoms"
+          :box-vectors="boxVectors"
+          :shear-band-atoms="shearBandCoords"
+          :yield-event="latestYieldEvent"
+          :atom-types="projectionAtomTypes"
+          class="projection-chart"
+        />
+
         <div v-if="hoveredData" class="hover-info-panel">
           <h4>悬停时间点详情</h4>
           <div class="hover-grid">
@@ -131,17 +141,59 @@
               <span>Co-Cr S_ij: {{ csroResult.S_ij?.toFixed(4) }}</span>
             </div>
           </div>
+
+          <div class="analysis-card nonaffine-card">
+            <h4>塑性屈服监测</h4>
+            <div class="monitor-status" :class="{ active: isNonaffineMonitoring }">
+              <span class="status-dot"></span>
+              <span>{{ isNonaffineMonitoring ? '监测中' : '未启动' }}</span>
+            </div>
+            <button 
+              @click="startNonaffineMonitor" 
+              :disabled="!dataInfo || isNonaffineMonitoring"
+              class="btn-monitor"
+            >
+              启动D²_min监测
+            </button>
+            <button 
+              @click="stopNonaffineMonitor" 
+              :disabled="!isNonaffineMonitoring"
+              class="btn-stop"
+            >
+              停止监测
+            </button>
+            <div v-if="latestNonaffine" class="nonaffine-result">
+              <span>屈服原子: {{ latestNonaffine.n_yielding }}</span>
+            </div>
+          </div>
         </div>
       </section>
     </main>
+
+    <YieldFailureModal
+      :visible="showFailureModal"
+      :severity="latestYieldEvent?.severity || 'warning'"
+      :timestep="latestYieldEvent?.timestep || 0"
+      :n-yielding="latestYieldEvent?.n_yielding || 0"
+      :yield-ratio="latestYieldEvent?.yield_ratio || 0"
+      :dissipated-energy="latestYieldEvent?.dissipated_energy || 0"
+      :threshold="0.08"
+      :dissipation-curve="latestYieldEvent?.dissipation_curve"
+      @close="showFailureModal = false"
+      @acknowledge="handleFailureAcknowledge"
+      @halt="handleFailureHalt"
+    />
   </div>
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import ControlPanel from './components/ControlPanel.vue'
 import StackedAreaChart from './components/StackedAreaChart.vue'
+import MicrostructureProjection from './components/MicrostructureProjection.vue'
+import YieldFailureModal from './components/YieldFailureModal.vue'
 import { useEvolutionStream } from './composables/useEvolutionStream'
+import { useNonaffineMonitor } from './composables/useNonaffineMonitor'
 import { useApi } from './composables/useApi'
 
 const {
@@ -157,6 +209,16 @@ const {
   binarySearchTimestep,
   getColor
 } = useEvolutionStream()
+
+const {
+  isMonitoring: isNonaffineMonitoring,
+  yieldEvents,
+  latestNonaffine,
+  connectionStatus: nonaffineStatus,
+  connect: connectNonaffine,
+  disconnect: disconnectNonaffine,
+  reset: resetNonaffine
+} = useNonaffineMonitor()
 
 const {
   loadData,
@@ -177,6 +239,13 @@ const isAnalyzing = ref(false)
 const rdfResult = ref(null)
 const voronoiResult = ref(null)
 const csroResult = ref(null)
+
+const showFailureModal = ref(false)
+const latestYieldEvent = ref(null)
+const projectionAtoms = ref([])
+const projectionAtomTypes = ref([])
+const shearBandCoords = ref([])
+const boxVectors = ref(null)
 
 const totalAtoms = computed(() => {
   if (!frameInfo.value?.type_counts) return 0
@@ -275,6 +344,53 @@ const analyzeCSRO = async () => {
     isAnalyzing.value = false
   }
 }
+
+const startNonaffineMonitor = () => {
+  if (!dataInfo.value) return
+  connectNonaffine({
+    startFrame: 0,
+    yieldThreshold: 0.08,
+    intervalMs: 100
+  })
+}
+
+const stopNonaffineMonitor = () => {
+  disconnectNonaffine()
+}
+
+const handleYieldEvent = (event) => {
+  latestYieldEvent.value = event
+  showFailureModal.value = true
+  
+  if (event.shear_band_coords && event.shear_band_coords.length > 0) {
+    shearBandCoords.value = event.shear_band_coords[0]
+  }
+}
+
+const handleFailureAcknowledge = () => {
+  showFailureModal.value = false
+}
+
+const handleFailureHalt = () => {
+  showFailureModal.value = false
+  stopNonaffineMonitor()
+}
+
+const loadProjectionData = async (frameIdx) => {
+  try {
+    const info = await getFrameInfo(frameIdx || 0)
+    boxVectors.value = info.box_vectors
+  } catch (e) {
+    console.warn('Failed to load projection data:', e)
+  }
+}
+
+watch(yieldEvents, (newEvents) => {
+  if (newEvents.length > 0) {
+    const latest = newEvents[newEvents.length - 1]
+    handleYieldEvent(latest)
+  }
+}, { deep: true })
 
 const findFirstPeak = (r, gr) => {
   let maxVal = 0
@@ -586,12 +702,108 @@ onMounted(() => {
 .rdf-card { border-left: 3px solid #667eea; }
 .voronoi-card { border-left: 3px solid #4ecdc4; }
 .csro-card { border-left: 3px solid #ff6b6b; }
+.nonaffine-card { border-left: 3px solid #ff00ff; }
+
+.monitor-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  font-size: 13px;
+  color: #8080a0;
+}
+
+.monitor-status.active {
+  color: #ff80ff;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #606080;
+}
+
+.monitor-status.active .status-dot {
+  background: #ff00ff;
+  box-shadow: 0 0 8px #ff00ff;
+  animation: blink 1s ease-in-out infinite;
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+.btn-monitor {
+  width: 100%;
+  margin-bottom: 8px;
+  background: linear-gradient(135deg, #ff00ff, #aa00aa);
+  color: white;
+  border: none;
+  border-radius: 6px;
+  padding: 10px 16px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.btn-monitor:hover:not(:disabled) {
+  box-shadow: 0 4px 15px rgba(255, 0, 255, 0.4);
+  transform: translateY(-1px);
+}
+
+.btn-monitor:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-stop {
+  width: 100%;
+  background: rgba(60, 60, 90, 0.5);
+  color: #b0b0d0;
+  border: 1px solid rgba(100, 100, 150, 0.4);
+  border-radius: 6px;
+  padding: 8px 16px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s;
+  font-size: 13px;
+}
+
+.btn-stop:hover:not(:disabled) {
+  background: rgba(80, 80, 120, 0.6);
+  color: #e0e0f0;
+}
+
+.btn-stop:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.nonaffine-result {
+  padding-top: 12px;
+  border-top: 1px solid rgba(255, 0, 255, 0.2);
+  font-size: 13px;
+  color: #ff80ff;
+  font-weight: 500;
+}
+
+.projection-chart {
+  margin-top: 5px;
+}
 
 @media (max-width: 1400px) {
   .analysis-cards {
-    grid-template-columns: 1fr;
+    grid-template-columns: repeat(2, 1fr);
   }
   .hover-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 900px) {
+  .analysis-cards {
     grid-template-columns: 1fr;
   }
 }

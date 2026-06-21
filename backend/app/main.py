@@ -136,6 +136,22 @@ async def get_atom_neighbors(frame_idx: int, atom_idx: int, cutoff: float = 3.5)
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@app.get("/api/nonaffine/{frame_idx_ref}/{frame_idx_def}")
+async def get_nonaffine_analysis(frame_idx_ref: int, frame_idx_def: int):
+    try:
+        return analysis_service.analyze_nonaffine(frame_idx_ref, frame_idx_def)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/yield-events")
+async def get_yield_events():
+    try:
+        return {"events": analysis_service.get_yield_events()}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @app.websocket("/ws/evolution")
 async def websocket_evolution(websocket: WebSocket,
                               start_frame: int = 0,
@@ -155,6 +171,44 @@ async def websocket_evolution(websocket: WebSocket,
             await websocket.send_json(data)
             await asyncio.sleep(interval_ms / 1000.0)
         await websocket.send_json({"done": True, "frames_processed": end_frame - start_frame + 1})
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        try:
+            await websocket.send_json({"error": str(e)})
+        except:
+            pass
+    finally:
+        try:
+            await websocket.close()
+        except:
+            pass
+
+
+@app.websocket("/ws/nonaffine-monitor")
+async def websocket_nonaffine_monitor(websocket: WebSocket,
+                                      start_frame: int = 0,
+                                      end_frame: int = None,
+                                      yield_threshold: float = 0.08,
+                                      interval_ms: int = 200):
+    await websocket.accept()
+    try:
+        if not analysis_service.unpacker:
+            await websocket.send_json({"error": "No data loaded"})
+            await websocket.close()
+            return
+        if end_frame is None:
+            end_frame = analysis_service.unpacker.n_frames - 1
+        for data in analysis_service.get_nonaffine_stream(
+            start_frame, end_frame, yield_threshold
+        ):
+            await websocket.send_json(data)
+            await asyncio.sleep(interval_ms / 1000.0)
+        await websocket.send_json({
+            "done": True,
+            "frames_processed": end_frame - start_frame,
+            "total_yield_events": len(analysis_service.get_yield_events())
+        })
     except WebSocketDisconnect:
         pass
     except Exception as e:

@@ -74,6 +74,16 @@ export function useApi() {
     return response.data
   }
 
+  const getNonaffineAnalysis = async (frameIdxRef, frameIdxDef) => {
+    const response = await apiClient.get(`/nonaffine/${frameIdxRef}/${frameIdxDef}`)
+    return response.data
+  }
+
+  const getYieldEvents = async () => {
+    const response = await apiClient.get('/yield-events')
+    return response.data
+  }
+
   const healthCheck = async () => {
     const response = await apiClient.get('/health')
     return response.data
@@ -91,6 +101,8 @@ export function useApi() {
     getCSROAllPairs,
     queryCSROByTimestep,
     getAtomNeighbors,
+    getNonaffineAnalysis,
+    getYieldEvents,
     healthCheck
   }
 }
