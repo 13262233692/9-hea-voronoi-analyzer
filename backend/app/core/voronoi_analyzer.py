@@ -1,8 +1,9 @@
 import numpy as np
-from scipy.spatial import ConvexHull, Delaunay
-from typing import List, Tuple, Dict
+from scipy.spatial import ConvexHull
+from typing import List, Dict
 from collections import Counter
 from .cell_binning import CellBinning
+from .md_unpacker import TriclinicBox
 
 
 class VoronoiAnalyzer:
@@ -10,17 +11,14 @@ class VoronoiAnalyzer:
         self.cutoff = cutoff
         self.max_neighbors = max_neighbors
 
-    def _minimum_image(self, dr: np.ndarray, box_lengths: np.ndarray) -> np.ndarray:
-        return dr - box_lengths * np.round(dr / box_lengths)
-
-    def _compute_voronoi_index(self, central_atom: int, coords: np.ndarray,
-                                neighbors: List[int], box_lengths: np.ndarray) -> np.ndarray:
-        if len(neighbors) < 4:
+    def _compute_voronoi_index(self, central_coord: np.ndarray, neighbor_coords: np.ndarray,
+                                box: TriclinicBox) -> np.ndarray:
+        n_neighbors = len(neighbor_coords)
+        if n_neighbors < 4:
             return np.zeros(10, dtype=np.int32)
-        central_coord = coords[central_atom]
-        neighbor_coords = np.array([coords[j] for j in neighbors])
-        rel_coords = neighbor_coords - central_coord
-        rel_coords = np.array([self._minimum_image(r, box_lengths) for r in rel_coords])
+        rel_coords = np.zeros_like(neighbor_coords)
+        for i in range(n_neighbors):
+            rel_coords[i] = box.minimum_image_vector(neighbor_coords[i] - central_coord)
         try:
             hull = ConvexHull(rel_coords)
         except:
@@ -35,41 +33,26 @@ class VoronoiAnalyzer:
                 vor_index[idx] += 1
         return vor_index
 
-    def analyze_atom(self, atom_idx: int, coords: np.ndarray, box: np.ndarray,
+    def analyze_atom(self, atom_idx: int, coords: np.ndarray, box: TriclinicBox,
                      cb: CellBinning = None) -> np.ndarray:
         if cb is None:
             cb = CellBinning(coords, box, self.cutoff)
-        neighbors = cb.get_neighbors(atom_idx)
-        box_lengths = box[:, 1] - box[:, 0]
-        if len(neighbors) > self.max_neighbors:
-            distances = []
-            central_coord = coords[atom_idx]
-            for j in neighbors:
-                dr = coords[j] - central_coord
-                dr = self._minimum_image(dr, box_lengths)
-                distances.append(np.sqrt(np.sum(dr * dr)))
-            sorted_idx = np.argsort(distances)
-            neighbors = [neighbors[i] for i in sorted_idx[:self.max_neighbors]]
-        return self._compute_voronoi_index(atom_idx, coords, neighbors, box_lengths)
+        neighbors, distances = cb.get_neighbor_list_sorted(atom_idx, self.max_neighbors)
+        if len(neighbors) == 0:
+            return np.zeros(10, dtype=np.int32)
+        neighbor_coords = np.array([coords[j] for j in neighbors])
+        return self._compute_voronoi_index(coords[atom_idx], neighbor_coords, box)
 
-    def analyze_frame(self, coords: np.ndarray, box: np.ndarray, types: np.ndarray = None,
+    def analyze_frame(self, coords: np.ndarray, box: TriclinicBox, types: np.ndarray = None,
                       progress_callback=None) -> Dict:
         n_atoms = coords.shape[0]
         cb = CellBinning(coords, box, self.cutoff)
         vor_indices = np.zeros((n_atoms, 10), dtype=np.int32)
-        box_lengths = box[:, 1] - box[:, 0]
         for i in range(n_atoms):
-            neighbors = cb.get_neighbors(i)
-            if len(neighbors) > self.max_neighbors:
-                distances = []
-                central_coord = coords[i]
-                for j in neighbors:
-                    dr = coords[j] - central_coord
-                    dr = self._minimum_image(dr, box_lengths)
-                    distances.append(np.sqrt(np.sum(dr * dr)))
-                sorted_idx = np.argsort(distances)
-                neighbors = [neighbors[k] for k in sorted_idx[:self.max_neighbors]]
-            vor_indices[i] = self._compute_voronoi_index(i, coords, neighbors, box_lengths)
+            neighbors, distances = cb.get_neighbor_list_sorted(i, self.max_neighbors)
+            if len(neighbors) > 0:
+                neighbor_coords = np.array([coords[j] for j in neighbors])
+                vor_indices[i] = self._compute_voronoi_index(coords[i], neighbor_coords, box)
             if progress_callback and (i + 1) % 10000 == 0:
                 progress_callback(i + 1, n_atoms)
         vor_index_strings = [tuple(idx) for idx in vor_indices]
@@ -113,7 +96,8 @@ class VoronoiAnalyzer:
         for fi, frame in enumerate(frames):
             result = self.analyze_frame(frame.coords, frame.box, frame.types)
             timesteps.append(frame.timestep)
-            type_strings = [self.get_polyhedron_type(np.array(idx)) for idx in result['voronoi_indices']]
+            type_strings = [self.get_polyhedron_type(np.array(idx))
+                            for idx in result['voronoi_indices']]
             counts = Counter(type_strings)
             for ptype, count in counts.items():
                 if ptype not in evolution_data:

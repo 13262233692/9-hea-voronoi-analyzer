@@ -1,7 +1,9 @@
 import os
+import gc
 import numpy as np
-from typing import Dict, List, Optional, Tuple
-from ..core.md_unpacker import MmapMDUnpacker, MDFrame
+from typing import Dict, List, Optional
+import weakref
+from ..core.md_unpacker import MmapMDUnpacker, MDFrame, TriclinicBox, create_test_md_file
 from ..core.cell_binning import CellBinning
 from ..core.rdf_calculator import RDFCalculator
 from ..core.voronoi_analyzer import VoronoiAnalyzer
@@ -10,41 +12,70 @@ from ..core.csro_calculator import CSROCalculator
 
 class AnalysisService:
     _instance = None
+    _instance_ref = None
 
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
             cls._instance._initialized = False
+            cls._instance_ref = weakref.ref(cls._instance)
         return cls._instance
 
     def __init__(self):
         if self._initialized:
             return
         self._initialized = True
-        self.unpacker: Optional[MmapMDUnpacker] = None
+        self._unpacker: Optional[MmapMDUnpacker] = None
         self.current_file: Optional[str] = None
         self.rdf_calc = RDFCalculator(r_min=0.0, r_max=6.0, n_bins=100)
         self.voronoi_analyzer = VoronoiAnalyzer(cutoff=5.0)
         self.csro_calc = CSROCalculator(cutoff=3.5)
         self.element_map = {1: 'Al', 2: 'Co', 3: 'Cr', 4: 'Fe', 5: 'Ni'}
+        self._frame_cache = {}
+        self._max_cache_frames = 5
+
+    @property
+    def unpacker(self) -> Optional[MmapMDUnpacker]:
+        return self._unpacker
 
     def load_data(self, filepath: str) -> Dict:
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"File not found: {filepath}")
-        if self.unpacker:
-            self.unpacker.close()
-        self.unpacker = MmapMDUnpacker(filepath)
+        self._safe_close_unpacker()
+        self._frame_cache.clear()
+        gc.collect()
+        self._unpacker = MmapMDUnpacker(filepath)
         self.current_file = filepath
+        frame0 = self._unpacker[0] if self._unpacker.n_frames > 0 else None
         return {
-            'n_frames': self.unpacker.n_frames,
+            'n_frames': self._unpacker.n_frames,
             'file': filepath,
-            'n_atoms': self.unpacker[0].n_atoms if self.unpacker.n_frames > 0 else 0
+            'n_atoms': frame0.n_atoms if frame0 else 0,
+            'is_triclinic': self._unpacker.is_triclinic() if frame0 else False,
+            'volume': float(frame0.box.volume) if frame0 else 0.0,
+            'cell_matrix': frame0.box.h_matrix.tolist() if frame0 else None
         }
 
+    def _safe_close_unpacker(self):
+        if self._unpacker is not None:
+            try:
+                self._unpacker.close()
+            except Exception:
+                pass
+            self._unpacker = None
+            gc.collect()
+
     def get_frame(self, idx: int) -> MDFrame:
-        if not self.unpacker:
+        if self._unpacker is None:
             raise RuntimeError("No data loaded")
-        return self.unpacker[idx]
+        if idx in self._frame_cache:
+            return self._frame_cache[idx]
+        frame = self._unpacker[idx]
+        if len(self._frame_cache) >= self._max_cache_frames:
+            oldest_key = next(iter(self._frame_cache))
+            del self._frame_cache[oldest_key]
+        self._frame_cache[idx] = frame
+        return frame
 
     def get_frame_info(self, idx: int) -> Dict:
         frame = self.get_frame(idx)
@@ -53,10 +84,18 @@ class AnalysisService:
         for t, c in zip(unique_types, counts):
             elem = self.element_map.get(int(t), f'Type{t}')
             type_info[elem] = int(c)
+        bounds = frame.box.get_bounds()
         return {
             'timestep': frame.timestep,
             'n_atoms': frame.n_atoms,
-            'box': frame.box.tolist(),
+            'box': bounds.tolist(),
+            'box_vectors': {
+                'a': frame.box.a_vec.tolist(),
+                'b': frame.box.b_vec.tolist(),
+                'c': frame.box.c_vec.tolist()
+            },
+            'is_triclinic': not frame.box.orthorhombic,
+            'volume': float(frame.box.volume),
             'type_counts': type_info
         }
 
@@ -114,12 +153,12 @@ class AnalysisService:
         return formatted
 
     def find_frame_by_timestep(self, target_timestep: int) -> int:
-        if not self.unpacker:
+        if self._unpacker is None:
             raise RuntimeError("No data loaded")
-        low, high = 0, self.unpacker.n_frames - 1
+        low, high = 0, self._unpacker.n_frames - 1
         while low <= high:
             mid = (low + high) // 2
-            mid_ts = self.unpacker[mid].timestep
+            mid_ts = self._unpacker[mid].timestep
             if mid_ts == target_timestep:
                 return mid
             elif mid_ts < target_timestep:
@@ -128,20 +167,20 @@ class AnalysisService:
                 high = mid - 1
         if high < 0:
             return 0
-        if low >= self.unpacker.n_frames:
-            return self.unpacker.n_frames - 1
-        high_ts = self.unpacker[high].timestep
-        low_ts = self.unpacker[low].timestep
+        if low >= self._unpacker.n_frames:
+            return self._unpacker.n_frames - 1
+        high_ts = self._unpacker[high].timestep
+        low_ts = self._unpacker[low].timestep
         if abs(target_timestep - high_ts) < abs(target_timestep - low_ts):
             return high
         return low
 
     def get_evolution_stream(self, start_frame: int = 0, end_frame: int = None,
                               polyhedron_types: List[str] = None):
-        if not self.unpacker:
+        if self._unpacker is None:
             raise RuntimeError("No data loaded")
         if end_frame is None:
-            end_frame = self.unpacker.n_frames - 1
+            end_frame = self._unpacker.n_frames - 1
         for i in range(start_frame, end_frame + 1):
             frame = self.get_frame(i)
             result = self.voronoi_analyzer.analyze_frame(frame.coords, frame.box, frame.types)
@@ -161,7 +200,8 @@ class AnalysisService:
                 'frame_idx': i,
                 'timestep': frame.timestep,
                 'time_ps': frame.timestep / 1000.0,
-                'counts': counts
+                'counts': counts,
+                'is_triclinic': not frame.box.orthorhombic
             }
 
     def get_atom_neighbors(self, frame_idx: int, atom_idx: int, cutoff: float = 3.5) -> Dict:
@@ -173,15 +213,29 @@ class AnalysisService:
         return {
             'atom_idx': atom_idx,
             'atom_type': int(frame.types[atom_idx]),
-            'atom_element': self.element_map.get(int(frame.types[atom_idx]), f'Type{frame.types[atom_idx]}'),
+            'atom_element': self.element_map.get(
+                int(frame.types[atom_idx]),
+                f'Type{frame.types[atom_idx]}'
+            ),
             'coord': frame.coords[atom_idx].tolist(),
             'neighbors': neighbors,
             'neighbor_types': neighbor_types,
             'neighbor_elements': neighbor_elements,
-            'distances': distances.tolist()
+            'distances': distances.tolist(),
+            'n_neighbors': len(neighbors)
         }
 
+    def clear_cache(self):
+        self._frame_cache.clear()
+        gc.collect()
+
     def close(self):
-        if self.unpacker:
-            self.unpacker.close()
-            self.unpacker = None
+        self._safe_close_unpacker()
+        self._frame_cache.clear()
+        gc.collect()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass

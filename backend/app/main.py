@@ -17,6 +17,8 @@ class GenerateTestDataRequest(BaseModel):
     filepath: str
     n_frames: int = 10
     n_atoms: int = 100000
+    triclinic: bool = False
+    tilt_factor: float = 0.3
 
 app = FastAPI(title="AlCoCrFeNi HEA Microstructure Analysis Workstation",
               description="High-entropy alloy microstructure analysis backend",
@@ -171,13 +173,21 @@ async def websocket_evolution(websocket: WebSocket,
 async def generate_test_data(request: GenerateTestDataRequest):
     try:
         import os
-        os.makedirs(os.path.dirname(request.filepath), exist_ok=True)
-        create_test_md_file(request.filepath, request.n_frames, request.n_atoms)
+        os.makedirs(os.path.dirname(os.path.abspath(request.filepath)), exist_ok=True)
+        create_test_md_file(
+            request.filepath,
+            request.n_frames,
+            request.n_atoms,
+            triclinic=request.triclinic,
+            tilt_factor=request.tilt_factor
+        )
         return {
             "status": "success",
             "filepath": request.filepath,
             "n_frames": request.n_frames,
-            "n_atoms": request.n_atoms
+            "n_atoms": request.n_atoms,
+            "triclinic": request.triclinic,
+            "tilt_factor": request.tilt_factor
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))

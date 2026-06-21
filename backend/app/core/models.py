@@ -6,10 +6,19 @@ class LoadDataRequest(BaseModel):
     filepath: str
 
 
+class BoxVectors(BaseModel):
+    a: List[float]
+    b: List[float]
+    c: List[float]
+
+
 class FrameInfoResponse(BaseModel):
     timestep: int
     n_atoms: int
     box: List[List[float]]
+    box_vectors: Optional[BoxVectors] = None
+    is_triclinic: Optional[bool] = None
+    volume: Optional[float] = None
     type_counts: Dict[str, int]
 
 
@@ -18,6 +27,8 @@ class RDFResponse(BaseModel):
     gr: List[float]
     gr_raw: Optional[List[float]] = None
     partial_gr: Optional[Dict[str, List[float]]] = None
+    volume: Optional[float] = None
+    density: Optional[float] = None
 
 
 class VoronoiResponse(BaseModel):
@@ -48,6 +59,8 @@ class CSROResponse(BaseModel):
     N_AA: float
     N_BB: float
     N_AB: float
+    volume: Optional[float] = None
+    cell_type: Optional[str] = None
 
 
 class EvolutionStreamData(BaseModel):
@@ -55,6 +68,7 @@ class EvolutionStreamData(BaseModel):
     timestep: int
     time_ps: float
     counts: Dict[str, int]
+    is_triclinic: Optional[bool] = None
 
 
 class NeighborsResponse(BaseModel):
@@ -66,6 +80,7 @@ class NeighborsResponse(BaseModel):
     neighbor_types: List[int]
     neighbor_elements: List[str]
     distances: List[float]
+    n_neighbors: Optional[int] = None
 
 
 class CSROQueryRequest(BaseModel):
